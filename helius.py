@@ -73,7 +73,7 @@ def fetch_trades(token_mint, api_key, max_transactions=1000, progress_callback=N
         raise Exception("STOP")
 
         if not isinstance(batch, list) or not batch:
-    break
+            break
 
         for tx in batch:
             if not tx:
