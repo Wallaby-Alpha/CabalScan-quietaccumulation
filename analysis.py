@@ -56,7 +56,7 @@ def wallet_summary(df: pd.DataFrame) -> pd.DataFrame:
         "first_buy_time": first_buy,
     })
 
-        ws["current_balance"] = (ws["bought"] - ws["sold"]).clip(lower=0)
+    ws["current_balance"] = (ws["bought"] - ws["sold"]).clip(lower=0)
     ws["retention_pct"] = (
         ws["current_balance"] / ws["bought"].replace(0, pd.NA)
     ) * 100
