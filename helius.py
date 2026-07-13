@@ -67,13 +67,13 @@ def fetch_trades(token_mint, api_key, max_transactions=1000, progress_callback=N
 
         batch = resp.json()
 
-        import json
+            import json
 
-        print(json.dumps(batch, indent=2)[:10000])
-        raise Exception("STOP")
+            print(json.dumps(batch, indent=2)[:10000])
+            raise Exception("STOP")
 
-        if not isinstance(batch, list) or not batch:
-            break
+            if not isinstance(batch, list) or not batch:
+                break
 
         for tx in batch:
             if not tx:
