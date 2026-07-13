@@ -49,44 +49,24 @@ def _sol_price_usd(api_key: str) -> float:
     return 150.0  # crude fallback if the lookup fails; report will still run
 
 
-def fetch_trades(
-    token_mint: str,
-    api_key: str,
-    max_transactions: int = 1000,
-    progress_callback=None,
-) -> list[Trade]:
-    """
-    Pull SWAP transactions involving token_mint from Helius and convert
-    each into a Trade (or two, for edge cases -- see note below).
-
-    Note on direction: for a SWAP transaction, the wallet is "buying"
-    token_mint if token_mint appears in tokenOutputs for that wallet's
-    transfer, and "selling" if it appears in tokenInputs.
-    """
+def fetch_trades(token_mint, api_key, max_transactions=1000, progress_callback=None):
     sol_price = _sol_price_usd(api_key)
-    trades: list[Trade] = []
+    trades = []
     before = None
     fetched = 0
 
     while fetched < max_transactions:
-        params = {
-            "api-key": api_key,
-            "type": "SWAP",
-            "limit": 100,
-        }
+        params = {"api-key": api_key, "limit": 100}   # <- drop server-side type=SWAP
         if before:
-            params["before"] = before
+            params["before-signature"] = before        # <- fixed param name
 
         url = f"{HELIUS_BASE}/addresses/{token_mint}/transactions"
         resp = requests.get(url, params=params, timeout=30)
-
         if resp.status_code != 200:
-            raise HeliusError(
-                f"Helius returned {resp.status_code}: {resp.text[:300]}"
-            )
+            raise HeliusError(f"Helius returned {resp.status_code}: {resp.text[:300]}")
 
         batch = resp.json()
-        if not batch:
+        if not isinstance(batch, list) or not batch:   # <- guard against {"error": ...} dicts
             break
 
         for tx in batch:
@@ -97,21 +77,16 @@ def fetch_trades(
                 trades.append(trade)
 
         fetched += len(batch)
-        last_tx = batch[-1] or {}
-        before = last_tx.get("signature")
+        before = (batch[-1] or {}).get("signature")
         if not before:
-            break  # can't paginate further without a signature to page from
-
+            break
         if progress_callback:
             progress_callback(fetched)
-
         if len(batch) < 100:
-            break  # last page
-
-        time.sleep(0.15)  # stay polite to the API
+            break
+        time.sleep(0.15)
 
     return trades
-
 
 def _parse_swap(tx: dict, token_mint: str, sol_price: float) -> Trade | None:
     """
