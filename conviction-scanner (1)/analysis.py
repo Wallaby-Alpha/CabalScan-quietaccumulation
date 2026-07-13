@@ -56,15 +56,22 @@ def wallet_summary(df: pd.DataFrame) -> pd.DataFrame:
         "first_buy_time": first_buy,
     })
 
-    ws["current_balance"] = (ws["bought"] - ws["sold"]).clip(lower=0)
-    ws["retention_pct"] = (ws["current_balance"] / ws["bought"].replace(0, pd.NA)) * 100
-    ws["avg_entry_price"] = ws["usd_invested"] / ws["bought"].replace(0, pd.NA)
-    ws["first_buy_time"] = (
-    pd.to_numeric(ws["first_buy_time"], errors="coerce")
-    .fillna(now)
-)
+        ws["current_balance"] = (ws["bought"] - ws["sold"]).clip(lower=0)
+    ws["retention_pct"] = (
+        ws["current_balance"] / ws["bought"].replace(0, pd.NA)
+    ) * 100
+    ws["avg_entry_price"] = (
+        ws["usd_invested"] / ws["bought"].replace(0, pd.NA)
+    )
 
-ws["days_held"] = ((now - ws["first_buy_time"]) / 86400).astype(float).round(1)
+    ws["first_buy_time"] = pd.to_numeric(
+        ws["first_buy_time"],
+        errors="coerce",
+    ).fillna(now)
+
+    ws["days_held"] = (
+        (now - ws["first_buy_time"]) / 86400
+    ).astype(float).round(1)
 
     return ws.reset_index().sort_values("usd_invested", ascending=False)
 
