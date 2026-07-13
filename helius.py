@@ -89,59 +89,78 @@ def fetch_trades(token_mint, api_key, max_transactions=1000, progress_callback=N
     return trades
 
 def _parse_swap(tx: dict, token_mint: str, sol_price: float) -> Trade | None:
-    """
-    Parse a single Helius enhanced-transaction SWAP event into a Trade.
-
-    Helius's "events.swap" block (when present) already resolves the
-    wallet, tokenInputs, tokenOutputs, nativeInput/nativeOutput. This is
-    the fast path. If events.swap is missing (some routers aren't
-    decoded), we skip the transaction rather than guess -- silently wrong
-    direction is worse than a missing data point.
-    """
-    swap = (tx.get("events") or {}).get("swap")
-    if not swap:
-        return None
-
-    # Helius sometimes returns these keys present but explicitly null
-    # (not just absent), so `.get("x", default)` alone isn't safe --
-    # the default only kicks in when the key is *missing*. Normalize to
-    # empty lists/dicts here, and drop any null entries inside the lists,
-    # before anything downstream touches them.
-    token_inputs = [t for t in (swap.get("tokenInputs") or []) if t]
-    token_outputs = [t for t in (swap.get("tokenOutputs") or []) if t]
-
     wallet = tx.get("feePayer")
-    if not wallet and token_outputs:
-        wallet = token_outputs[0].get("userAccount")
-    if not wallet and token_inputs:
-        wallet = token_inputs[0].get("userAccount")
     if not wallet:
         return None
 
-    token_in = next((t for t in token_inputs if t.get("mint") == token_mint), None)
-    token_out = next((t for t in token_outputs if t.get("mint") == token_mint), None)
+    # -------------------------------------------------------
+    # Fast path: Helius decoded the swap
+    # -------------------------------------------------------
+    swap = (tx.get("events") or {}).get("swap")
+    if swap:
+        token_inputs = [t for t in (swap.get("tokenInputs") or []) if t]
+        token_outputs = [t for t in (swap.get("tokenOutputs") or []) if t]
 
-    if token_out and not token_in:
-        direction = "buy"
-        amount = float(token_out.get("tokenAmount", 0))
-        usd_value = _counter_leg_usd(swap, sol_price, exclude_mint=token_mint)
-    elif token_in and not token_out:
-        direction = "sell"
-        amount = float(token_in.get("tokenAmount", 0))
-        usd_value = _counter_leg_usd(swap, sol_price, exclude_mint=token_mint)
-    else:
-        # both or neither -- not a clean buy/sell of this mint, skip
+        token_in = next((t for t in token_inputs if t.get("mint") == token_mint), None)
+        token_out = next((t for t in token_outputs if t.get("mint") == token_mint), None)
+
+        if token_out and not token_in:
+            return Trade(
+                wallet=wallet,
+                token_mint=token_mint,
+                direction="buy",
+                token_amount=float(token_out.get("tokenAmount", 0)),
+                usd_value=_counter_leg_usd(swap, sol_price, token_mint),
+                timestamp=int(tx.get("timestamp", 0)),
+                tx_sig=tx.get("signature", ""),
+            )
+
+        if token_in and not token_out:
+            return Trade(
+                wallet=wallet,
+                token_mint=token_mint,
+                direction="sell",
+                token_amount=float(token_in.get("tokenAmount", 0)),
+                usd_value=_counter_leg_usd(swap, sol_price, token_mint),
+                timestamp=int(tx.get("timestamp", 0)),
+                tx_sig=tx.get("signature", ""),
+            )
+
+    # -------------------------------------------------------
+    # Fallback: use token balance changes
+    # -------------------------------------------------------
+
+    changes = tx.get("accountData", [])
+
+    before = None
+    after = None
+
+    for acct in changes:
+        for bal in acct.get("tokenBalanceChanges", []) or []:
+            if bal.get("mint") != token_mint:
+                continue
+
+            if before is None:
+                before = float(bal.get("rawTokenAmount", {}).get("tokenAmount", 0))
+
+            after = float(bal.get("rawTokenAmount", {}).get("tokenAmount", 0))
+
+    if before is None or after is None:
         return None
 
-    if amount <= 0:
+    delta = after - before
+
+    if delta == 0:
         return None
+
+    direction = "buy" if delta > 0 else "sell"
 
     return Trade(
         wallet=wallet,
         token_mint=token_mint,
         direction=direction,
-        token_amount=amount,
-        usd_value=usd_value,
+        token_amount=abs(delta),
+        usd_value=0,
         timestamp=int(tx.get("timestamp", 0)),
         tx_sig=tx.get("signature", ""),
     )
