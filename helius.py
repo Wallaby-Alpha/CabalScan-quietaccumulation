@@ -90,12 +90,17 @@ def fetch_trades(
             break
 
         for tx in batch:
+            if not tx:
+                continue
             trade = _parse_swap(tx, token_mint, sol_price)
             if trade:
                 trades.append(trade)
 
         fetched += len(batch)
-        before = batch[-1].get("signature")
+        last_tx = batch[-1] or {}
+        before = last_tx.get("signature")
+        if not before:
+            break  # can't paginate further without a signature to page from
 
         if progress_callback:
             progress_callback(fetched)
@@ -122,16 +127,24 @@ def _parse_swap(tx: dict, token_mint: str, sol_price: float) -> Trade | None:
     if not swap:
         return None
 
-    wallet = tx.get("feePayer") or swap.get("tokenOutputs", [{}])[0].get("userAccount")
+    # Helius sometimes returns these keys present but explicitly null
+    # (not just absent), so `.get("x", default)` alone isn't safe --
+    # the default only kicks in when the key is *missing*. Normalize to
+    # empty lists/dicts here, and drop any null entries inside the lists,
+    # before anything downstream touches them.
+    token_inputs = [t for t in (swap.get("tokenInputs") or []) if t]
+    token_outputs = [t for t in (swap.get("tokenOutputs") or []) if t]
+
+    wallet = tx.get("feePayer")
+    if not wallet and token_outputs:
+        wallet = token_outputs[0].get("userAccount")
+    if not wallet and token_inputs:
+        wallet = token_inputs[0].get("userAccount")
     if not wallet:
         return None
 
-    token_in = next(
-        (t for t in swap.get("tokenInputs", []) if t.get("mint") == token_mint), None
-    )
-    token_out = next(
-        (t for t in swap.get("tokenOutputs", []) if t.get("mint") == token_mint), None
-    )
+    token_in = next((t for t in token_inputs if t.get("mint") == token_mint), None)
+    token_out = next((t for t in token_outputs if t.get("mint") == token_mint), None)
 
     if token_out and not token_in:
         direction = "buy"
@@ -164,15 +177,17 @@ def _counter_leg_usd(swap: dict, sol_price: float, exclude_mint: str) -> float:
     Estimate the USD value of a swap from whichever leg isn't our target
     token: native SOL, a stablecoin, or (fallback) just 0.
     """
-    native_in = float(swap.get("nativeInput", {}).get("amount", 0) or 0) / 1e9
-    native_out = float(swap.get("nativeOutput", {}).get("amount", 0) or 0) / 1e9
+    native_in = float((swap.get("nativeInput") or {}).get("amount", 0) or 0) / 1e9
+    native_out = float((swap.get("nativeOutput") or {}).get("amount", 0) or 0) / 1e9
     if native_in:
         return native_in * sol_price
     if native_out:
         return native_out * sol_price
 
-    for leg in swap.get("tokenInputs", []) + swap.get("tokenOutputs", []):
+    token_legs = [t for t in (swap.get("tokenInputs") or []) if t] + \
+                 [t for t in (swap.get("tokenOutputs") or []) if t]
+    for leg in token_legs:
         if leg.get("mint") in STABLE_MINTS and leg.get("mint") != exclude_mint:
-            return float(leg.get("tokenAmount", 0))
+            return float(leg.get("tokenAmount", 0) or 0)
 
     return 0.0
