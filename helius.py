@@ -66,8 +66,14 @@ def fetch_trades(token_mint, api_key, max_transactions=1000, progress_callback=N
             raise HeliusError(f"Helius returned {resp.status_code}: {resp.text[:300]}")
 
         batch = resp.json()
-        if not isinstance(batch, list) or not batch:   # <- guard against {"error": ...} dicts
-            break
+
+        import json
+
+        print(json.dumps(batch, indent=2)[:10000])
+        raise Exception("STOP")
+
+        if not isinstance(batch, list) or not batch:
+    break
 
         for tx in batch:
             if not tx:
