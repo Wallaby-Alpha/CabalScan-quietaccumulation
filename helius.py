@@ -282,22 +282,38 @@ def _parse_transfers(tx: dict, token_mint: str, sol_price: float) -> Trade | Non
         if n.get("toUserAccount") == wallet
     ) / 1e9
 
-    if direction == "buy" and sol_out:
-        usd_value = sol_out * sol_price
-    elif direction == "sell" and sol_in:
-        usd_value = sol_in * sol_price
-    elif direction == "buy":
-        usd_value = sum(
-            float(t.get("tokenAmount", 0) or 0)
-            for t in token_transfers
-            if t.get("fromUserAccount") == wallet and t.get("mint") in STABLE_MINTS
-        )
+    # Many AMMs (PumpSwap included) settle the SOL side of a swap as a
+    # wrapped-SOL (WSOL) *token* transfer rather than a native SOL
+    # transfer. Miss this and the counter-leg looks like it doesn't
+    # exist, even though real money changed hands.
+    wsol_out = sum(
+        float(t.get("tokenAmount", 0) or 0)
+        for t in token_transfers
+        if t.get("fromUserAccount") == wallet and t.get("mint") == SOL_MINT
+    )
+    wsol_in = sum(
+        float(t.get("tokenAmount", 0) or 0)
+        for t in token_transfers
+        if t.get("toUserAccount") == wallet and t.get("mint") == SOL_MINT
+    )
+    sol_out += wsol_out
+    sol_in += wsol_in
+
+    stable_out = sum(
+        float(t.get("tokenAmount", 0) or 0)
+        for t in token_transfers
+        if t.get("fromUserAccount") == wallet and t.get("mint") in STABLE_MINTS
+    )
+    stable_in = sum(
+        float(t.get("tokenAmount", 0) or 0)
+        for t in token_transfers
+        if t.get("toUserAccount") == wallet and t.get("mint") in STABLE_MINTS
+    )
+
+    if direction == "buy":
+        usd_value = (sol_out * sol_price) + stable_out
     else:
-        usd_value = sum(
-            float(t.get("tokenAmount", 0) or 0)
-            for t in token_transfers
-            if t.get("toUserAccount") == wallet and t.get("mint") in STABLE_MINTS
-        )
+        usd_value = (sol_in * sol_price) + stable_in
 
     if amount <= 0:
         return None
@@ -385,7 +401,7 @@ def debug_fetch(token_mint: str, api_key: str, sample: int = 200) -> dict:
 def _counter_leg_usd(swap: dict, sol_price: float, exclude_mint: str) -> float:
     """
     Estimate the USD value of a swap from whichever leg isn't our target
-    token: native SOL, a stablecoin, or (fallback) just 0.
+    token: native SOL, wrapped SOL, a stablecoin, or (fallback) just 0.
     """
     native_in = float((swap.get("nativeInput") or {}).get("amount", 0) or 0) / 1e9
     native_out = float((swap.get("nativeOutput") or {}).get("amount", 0) or 0) / 1e9
@@ -397,8 +413,14 @@ def _counter_leg_usd(swap: dict, sol_price: float, exclude_mint: str) -> float:
 
     token_legs = [t for t in (swap.get("tokenInputs") or []) if t] + \
                  [t for t in (swap.get("tokenOutputs") or []) if t]
+
     for leg in token_legs:
-        if leg.get("mint") in STABLE_MINTS and leg.get("mint") != exclude_mint:
+        mint = leg.get("mint")
+        if mint == exclude_mint:
+            continue
+        if mint == SOL_MINT:
+            return float(leg.get("tokenAmount", 0) or 0) * sol_price
+        if mint in STABLE_MINTS:
             return float(leg.get("tokenAmount", 0) or 0)
 
     return 0.0
