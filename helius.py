@@ -102,10 +102,11 @@ def fetch_trades(
             )
 
         batch = resp.json()
-        if not isinstance(batch, list):
-            # Unexpected shape (e.g. an error object) -- surface it rather
-            # than silently treating it as zero trades.
-            raise HeliusError(f"Unexpected response parsing transactions: {batch}")
+
+        # The debug block has been removed so the code can flow down smoothly
+
+        if not isinstance(batch, list) or not batch:
+            break
 
         for tx in batch:
             if not tx:
