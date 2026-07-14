@@ -1,6 +1,6 @@
 import streamlit as st
 
-from helius import fetch_trades, debug_fetch, HeliusError
+from helius import fetch_trades, HeliusError
 from analysis import trades_to_df, wallet_summary, seller_quality, ownership_migration, summary_stats
 from report import conviction_score, render_report
 
@@ -40,12 +40,15 @@ if run:
         pct = min(n / max_tx, 1.0)
         progress.progress(pct, text=f"Fetched {n} transactions...")
 
+    fetch_stats = {}
+
     try:
         trades = fetch_trades(
             token_mint.strip(),
             api_key.strip(),
             max_transactions=max_tx,
             progress_callback=_progress,
+            stats=fetch_stats,
         )
     except HeliusError as e:
         progress.empty()
@@ -60,16 +63,21 @@ if run:
 
     progress.empty()
 
+    with st.expander("Fetch diagnostics", expanded=not trades):
+        st.json(fetch_stats)
+        if fetch_stats.get("signatures_found", 0) >= max_tx:
+            st.caption(
+                f"Hit the {max_tx}-transaction cap -- there may be older "
+                "trades not included. Raise 'Max transactions to pull' in "
+                "the sidebar and rerun to widen the window."
+            )
+
     if not trades:
         st.warning(
             "No decodable swap transactions found for this token. "
-            "This can happen for very new/low-volume tokens or tokens "
-            "traded through routers Helius doesn't fully decode."
+            "Check the diagnostics above for why -- it'll show how many "
+            "signatures were found and why each one was skipped."
         )
-        with st.spinner("Running diagnostics..."):
-            info = debug_fetch(token_mint.strip(), api_key.strip())
-        st.subheader("Debug info")
-        st.json(info)
         st.stop()
 
     df = trades_to_df(trades)
