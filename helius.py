@@ -178,13 +178,15 @@ def _parse_swap(tx: dict, token_mint: str, sol_price: float) -> Trade | None:
     Fast path: Helius's "events.swap" block (when present) already
     resolves the wallet, tokenInputs, tokenOutputs, nativeInput/nativeOutput.
 
-    Fallback: many transactions get correctly tagged type == "SWAP" by
-    Helius's classifier but don't get an events.swap block built (some
-    DEX programs don't have a dedicated swap-event parser, even though
-    the underlying token/native transfers are fully decoded). Rather than
-    discard those, reconstruct the buy/sell from the raw tokenTransfers +
-    nativeTransfers arrays, which are present on essentially every parsed
-    transaction regardless of program.
+    Fallback: many swaps -- especially on newer/smaller programs like
+    PumpSwap -- don't get an events.swap block built, and aren't even
+    reliably tagged type == "SWAP" by Helius's classifier. Rather than
+    trust that tag, reconstruct the buy/sell from the raw tokenTransfers +
+    nativeTransfers arrays (present on essentially every parsed
+    transaction regardless of program) whenever there's a net token move
+    for the fee payer paired with a real SOL/stablecoin counter-leg. That
+    counter-leg requirement is what keeps plain transfers/airdrops from
+    being miscounted as trades.
     """
     swap = (tx.get("events") or {}).get("swap")
     if swap:
@@ -226,10 +228,13 @@ def _parse_swap(tx: dict, token_mint: str, sol_price: float) -> Trade | None:
             tx_sig=tx.get("signature", ""),
         )
 
-    if tx.get("type") == "SWAP":
-        return _parse_transfers(tx, token_mint, sol_price)
-
-    return None
+    # Generic fallback, tried regardless of Helius's `type` tag. Programs
+    # like PumpSwap often aren't classified as "SWAP" by Helius at all (they
+    # come through as UNKNOWN or something else), so gating on `type` was
+    # silently dropping entire DEXes. _parse_transfers only returns a Trade
+    # when it finds a real SOL/stablecoin counter-leg, which is what
+    # distinguishes an actual trade from a plain wallet-to-wallet transfer.
+    return _parse_transfers(tx, token_mint, sol_price)
 
 
 def _parse_transfers(tx: dict, token_mint: str, sol_price: float) -> Trade | None:
@@ -295,6 +300,13 @@ def _parse_transfers(tx: dict, token_mint: str, sol_price: float) -> Trade | Non
         )
 
     if amount <= 0:
+        return None
+
+    # No real SOL/stablecoin counter-leg found -- this wasn't a trade
+    # (e.g. a plain wallet-to-wallet transfer, an airdrop, or a claim).
+    # Without this check every non-swap token movement would get counted
+    # as a $0 "trade", which would wreck the wallet/retention math.
+    if usd_value <= 0:
         return None
 
     return Trade(
