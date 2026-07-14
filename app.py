@@ -1,6 +1,6 @@
 import streamlit as st
 
-from helius import fetch_trades, HeliusError
+from helius import fetch_trades, debug_fetch, HeliusError
 from analysis import trades_to_df, wallet_summary, seller_quality, ownership_migration, summary_stats
 from report import conviction_score, render_report
 
@@ -60,12 +60,16 @@ if run:
     progress.empty()
 
     if not trades:
-        st.warning(
-            "No decodable swap transactions found for this token. "
-            "This can happen for very new/low-volume tokens or tokens "
-            "traded through routers Helius doesn't fully decode."
-        )
-        st.stop()
+    st.warning(
+        "No decodable swap transactions found for this token. "
+        "This can happen for very new/low-volume tokens or tokens "
+        "traded through routers Helius doesn't fully decode."
+    )
+    with st.spinner("Running diagnostics..."):
+        info = debug_fetch(token_mint.strip(), api_key.strip())
+    st.subheader("Debug info")
+    st.json(info)
+    st.stop()
 
     df = trades_to_df(trades)
     ws = wallet_summary(df)
