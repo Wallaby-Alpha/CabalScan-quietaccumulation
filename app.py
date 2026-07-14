@@ -5,7 +5,6 @@ from analysis import trades_to_df, wallet_summary, seller_quality, ownership_mig
 from report import conviction_score, render_report
 
 st.set_page_config(page_title="Conviction Accumulation Scanner", layout="wide")
-
 st.title("Conviction Accumulation Scanner")
 st.caption("Phase 1: single-token ownership analysis. Not a live scanner (yet).")
 
@@ -54,22 +53,24 @@ if run:
         st.stop()
     except Exception as e:
         progress.empty()
-        st.error(f"Unexpected error fetching data: {e}")
+        import traceback
+        st.error("Unexpected error fetching data:")
+        st.code(traceback.format_exc())
         st.stop()
 
     progress.empty()
 
     if not trades:
-    st.warning(
-        "No decodable swap transactions found for this token. "
-        "This can happen for very new/low-volume tokens or tokens "
-        "traded through routers Helius doesn't fully decode."
-    )
-    with st.spinner("Running diagnostics..."):
-        info = debug_fetch(token_mint.strip(), api_key.strip())
-    st.subheader("Debug info")
-    st.json(info)
-    st.stop()
+        st.warning(
+            "No decodable swap transactions found for this token. "
+            "This can happen for very new/low-volume tokens or tokens "
+            "traded through routers Helius doesn't fully decode."
+        )
+        with st.spinner("Running diagnostics..."):
+            info = debug_fetch(token_mint.strip(), api_key.strip())
+        st.subheader("Debug info")
+        st.json(info)
+        st.stop()
 
     df = trades_to_df(trades)
     ws = wallet_summary(df)
@@ -82,8 +83,8 @@ if run:
 
     st.markdown("---")
     st.subheader("Wallet-level data")
-
     tab1, tab2 = st.tabs(["All buyers", "Sellers"])
+
     with tab1:
         st.dataframe(
             ws[[
@@ -92,6 +93,7 @@ if run:
             ]].round(2),
             use_container_width=True,
         )
+
     with tab2:
         if sq.empty:
             st.write("No sell activity found.")
