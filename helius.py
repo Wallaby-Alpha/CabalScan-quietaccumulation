@@ -69,6 +69,7 @@ def fetch_trades(
     api_key: str,
     max_transactions: int = 1000,
     progress_callback=None,
+    stats: dict | None = None,
 ) -> list[Trade]:
     """
     Pull SWAP transactions involving token_mint from Helius and convert
@@ -77,10 +78,29 @@ def fetch_trades(
     Note on direction: for a SWAP transaction, the wallet is "buying"
     token_mint if token_mint appears in tokenOutputs for that wallet's
     transfer, and "selling" if it appears in tokenInputs.
+
+    If `stats` is passed (a plain dict), it gets filled in-place with
+    counts of why each parsed transaction was kept or skipped, so the
+    caller can show real diagnostics for every run, not just empty ones.
     """
+    if stats is None:
+        stats = {}
+    stats.update({
+        "signatures_found": 0,
+        "transactions_parsed": 0,
+        "kept_via_events_swap": 0,
+        "kept_via_fallback": 0,
+        "skipped_no_wallet": 0,
+        "skipped_ambiguous_both_legs": 0,
+        "skipped_no_net_token_change": 0,
+        "skipped_no_counterleg": 0,
+        "skipped_zero_amount": 0,
+    })
+
     sol_price = _sol_price_usd(api_key)
 
     signatures = _get_signatures(token_mint, api_key, max_transactions)
+    stats["signatures_found"] = len(signatures)
     if not signatures:
         return []
 
@@ -103,14 +123,13 @@ def fetch_trades(
 
         batch = resp.json()
         if not isinstance(batch, list):
-            # Unexpected shape (e.g. an error object) -- surface it rather
-            # than silently treating it as zero trades.
             raise HeliusError(f"Unexpected response parsing transactions: {batch}")
 
         for tx in batch:
             if not tx:
                 continue
-            trade = _parse_swap(tx, token_mint, sol_price)
+            stats["transactions_parsed"] += 1
+            trade = _parse_swap(tx, token_mint, sol_price, stats)
             if trade:
                 trades.append(trade)
 
@@ -171,7 +190,7 @@ def _get_signatures(token_mint: str, api_key: str, max_transactions: int) -> lis
     return sigs[:max_transactions]
 
 
-def _parse_swap(tx: dict, token_mint: str, sol_price: float) -> Trade | None:
+def _parse_swap(tx: dict, token_mint: str, sol_price: float, stats: dict) -> Trade | None:
     """
     Parse a single Helius enhanced transaction into a Trade.
 
@@ -199,6 +218,7 @@ def _parse_swap(tx: dict, token_mint: str, sol_price: float) -> Trade | None:
         if not wallet and token_inputs:
             wallet = token_inputs[0].get("userAccount")
         if not wallet:
+            stats["skipped_no_wallet"] += 1
             return None
 
         token_in = next((t for t in token_inputs if t.get("mint") == token_mint), None)
@@ -213,11 +233,14 @@ def _parse_swap(tx: dict, token_mint: str, sol_price: float) -> Trade | None:
             amount = float(token_in.get("tokenAmount", 0))
             usd_value = _counter_leg_usd(swap, sol_price, exclude_mint=token_mint)
         else:
+            stats["skipped_ambiguous_both_legs"] += 1
             return None
 
         if amount <= 0:
+            stats["skipped_zero_amount"] += 1
             return None
 
+        stats["kept_via_events_swap"] += 1
         return Trade(
             wallet=wallet,
             token_mint=token_mint,
@@ -234,10 +257,10 @@ def _parse_swap(tx: dict, token_mint: str, sol_price: float) -> Trade | None:
     # silently dropping entire DEXes. _parse_transfers only returns a Trade
     # when it finds a real SOL/stablecoin counter-leg, which is what
     # distinguishes an actual trade from a plain wallet-to-wallet transfer.
-    return _parse_transfers(tx, token_mint, sol_price)
+    return _parse_transfers(tx, token_mint, sol_price, stats)
 
 
-def _parse_transfers(tx: dict, token_mint: str, sol_price: float) -> Trade | None:
+def _parse_transfers(tx: dict, token_mint: str, sol_price: float, stats: dict) -> Trade | None:
     """
     Reconstruct a buy/sell of token_mint from a transaction's raw
     tokenTransfers + nativeTransfers, for swaps Helius tagged but didn't
@@ -245,6 +268,7 @@ def _parse_transfers(tx: dict, token_mint: str, sol_price: float) -> Trade | Non
     """
     wallet = tx.get("feePayer")
     if not wallet:
+        stats["skipped_no_wallet"] += 1
         return None
 
     token_transfers = [t for t in (tx.get("tokenTransfers") or []) if t]
@@ -269,6 +293,7 @@ def _parse_transfers(tx: dict, token_mint: str, sol_price: float) -> Trade | Non
         direction = "sell"
         amount = -net
     else:
+        stats["skipped_no_net_token_change"] += 1
         return None
 
     sol_out = sum(
@@ -316,6 +341,7 @@ def _parse_transfers(tx: dict, token_mint: str, sol_price: float) -> Trade | Non
         usd_value = (sol_in * sol_price) + stable_in
 
     if amount <= 0:
+        stats["skipped_zero_amount"] += 1
         return None
 
     # No real SOL/stablecoin counter-leg found -- this wasn't a trade
@@ -323,8 +349,10 @@ def _parse_transfers(tx: dict, token_mint: str, sol_price: float) -> Trade | Non
     # Without this check every non-swap token movement would get counted
     # as a $0 "trade", which would wreck the wallet/retention math.
     if usd_value <= 0:
+        stats["skipped_no_counterleg"] += 1
         return None
 
+    stats["kept_via_fallback"] += 1
     return Trade(
         wallet=wallet,
         token_mint=token_mint,
@@ -334,68 +362,6 @@ def _parse_transfers(tx: dict, token_mint: str, sol_price: float) -> Trade | Non
         timestamp=int(tx.get("timestamp", 0)),
         tx_sig=tx.get("signature", ""),
     )
-
-
-def debug_fetch(token_mint: str, api_key: str, sample: int = 200) -> dict:
-    """
-    Diagnostic helper: pulls a small sample of signatures + parsed
-    transactions for token_mint and reports what came back, without
-    doing the full trade-conversion pipeline. Meant to be called from
-    the UI when fetch_trades() returns empty, so we can see *why*
-    without needing a separate script.
-    """
-    from collections import Counter
-
-    info = {
-        "signature_count": 0,
-        "parsed_count": 0,
-        "type_breakdown": {},
-        "events_swap_count": 0,
-        "sample_signature": None,
-        "sample_tx_keys": None,
-        "error": None,
-    }
-
-    try:
-        sigs = _get_signatures(token_mint, api_key, sample)
-        info["signature_count"] = len(sigs)
-        if sigs:
-            info["sample_signature"] = sigs[0]
-    except Exception as e:
-        info["error"] = f"getSignaturesForAddress failed: {e}"
-        return info
-
-    if not sigs:
-        return info
-
-    try:
-        resp = requests.post(
-            HELIUS_PARSE_URL,
-            params={"api-key": api_key},
-            json={"transactions": sigs[:100]},
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            info["error"] = f"parse call returned {resp.status_code}: {resp.text[:300]}"
-            return info
-
-        batch = resp.json()
-        if not isinstance(batch, list):
-            info["error"] = f"unexpected parse response shape: {batch}"
-            return info
-
-        info["parsed_count"] = len(batch)
-        types = Counter(tx.get("type") for tx in batch if tx)
-        info["type_breakdown"] = dict(types)
-        info["events_swap_count"] = sum(
-            1 for tx in batch if tx and (tx.get("events") or {}).get("swap")
-        )
-        if batch and batch[0]:
-            info["sample_tx_keys"] = list(batch[0].keys())
-    except Exception as e:
-        info["error"] = f"parse call failed: {e}"
-
-    return info
 
 
 def _counter_leg_usd(swap: dict, sol_price: float, exclude_mint: str) -> float:
