@@ -173,48 +173,126 @@ def _get_signatures(token_mint: str, api_key: str, max_transactions: int) -> lis
 
 def _parse_swap(tx: dict, token_mint: str, sol_price: float) -> Trade | None:
     """
-    Parse a single Helius enhanced-transaction SWAP event into a Trade.
+    Parse a single Helius enhanced transaction into a Trade.
 
-    Helius's "events.swap" block (when present) already resolves the
-    wallet, tokenInputs, tokenOutputs, nativeInput/nativeOutput. This is
-    the fast path. If events.swap is missing (some routers aren't
-    decoded), we skip the transaction rather than guess -- silently wrong
-    direction is worse than a missing data point.
+    Fast path: Helius's "events.swap" block (when present) already
+    resolves the wallet, tokenInputs, tokenOutputs, nativeInput/nativeOutput.
+
+    Fallback: many transactions get correctly tagged type == "SWAP" by
+    Helius's classifier but don't get an events.swap block built (some
+    DEX programs don't have a dedicated swap-event parser, even though
+    the underlying token/native transfers are fully decoded). Rather than
+    discard those, reconstruct the buy/sell from the raw tokenTransfers +
+    nativeTransfers arrays, which are present on essentially every parsed
+    transaction regardless of program.
     """
     swap = (tx.get("events") or {}).get("swap")
-    if not swap:
-        return None
+    if swap:
+        token_inputs = [t for t in (swap.get("tokenInputs") or []) if t]
+        token_outputs = [t for t in (swap.get("tokenOutputs") or []) if t]
 
-    # Helius sometimes returns these keys present but explicitly null
-    # (not just absent), so `.get("x", default)` alone isn't safe --
-    # the default only kicks in when the key is *missing*. Normalize to
-    # empty lists/dicts here, and drop any null entries inside the lists,
-    # before anything downstream touches them.
-    token_inputs = [t for t in (swap.get("tokenInputs") or []) if t]
-    token_outputs = [t for t in (swap.get("tokenOutputs") or []) if t]
+        wallet = tx.get("feePayer")
+        if not wallet and token_outputs:
+            wallet = token_outputs[0].get("userAccount")
+        if not wallet and token_inputs:
+            wallet = token_inputs[0].get("userAccount")
+        if not wallet:
+            return None
 
+        token_in = next((t for t in token_inputs if t.get("mint") == token_mint), None)
+        token_out = next((t for t in token_outputs if t.get("mint") == token_mint), None)
+
+        if token_out and not token_in:
+            direction = "buy"
+            amount = float(token_out.get("tokenAmount", 0))
+            usd_value = _counter_leg_usd(swap, sol_price, exclude_mint=token_mint)
+        elif token_in and not token_out:
+            direction = "sell"
+            amount = float(token_in.get("tokenAmount", 0))
+            usd_value = _counter_leg_usd(swap, sol_price, exclude_mint=token_mint)
+        else:
+            return None
+
+        if amount <= 0:
+            return None
+
+        return Trade(
+            wallet=wallet,
+            token_mint=token_mint,
+            direction=direction,
+            token_amount=amount,
+            usd_value=usd_value,
+            timestamp=int(tx.get("timestamp", 0)),
+            tx_sig=tx.get("signature", ""),
+        )
+
+    if tx.get("type") == "SWAP":
+        return _parse_transfers(tx, token_mint, sol_price)
+
+    return None
+
+
+def _parse_transfers(tx: dict, token_mint: str, sol_price: float) -> Trade | None:
+    """
+    Reconstruct a buy/sell of token_mint from a transaction's raw
+    tokenTransfers + nativeTransfers, for swaps Helius tagged but didn't
+    build an events.swap block for.
+    """
     wallet = tx.get("feePayer")
-    if not wallet and token_outputs:
-        wallet = token_outputs[0].get("userAccount")
-    if not wallet and token_inputs:
-        wallet = token_inputs[0].get("userAccount")
     if not wallet:
         return None
 
-    token_in = next((t for t in token_inputs if t.get("mint") == token_mint), None)
-    token_out = next((t for t in token_outputs if t.get("mint") == token_mint), None)
+    token_transfers = [t for t in (tx.get("tokenTransfers") or []) if t]
+    native_transfers = [n for n in (tx.get("nativeTransfers") or []) if n]
 
-    if token_out and not token_in:
+    amount_in = sum(
+        float(t.get("tokenAmount", 0) or 0)
+        for t in token_transfers
+        if t.get("toUserAccount") == wallet and t.get("mint") == token_mint
+    )
+    amount_out = sum(
+        float(t.get("tokenAmount", 0) or 0)
+        for t in token_transfers
+        if t.get("fromUserAccount") == wallet and t.get("mint") == token_mint
+    )
+
+    net = amount_in - amount_out
+    if net > 0:
         direction = "buy"
-        amount = float(token_out.get("tokenAmount", 0))
-        usd_value = _counter_leg_usd(swap, sol_price, exclude_mint=token_mint)
-    elif token_in and not token_out:
+        amount = net
+    elif net < 0:
         direction = "sell"
-        amount = float(token_in.get("tokenAmount", 0))
-        usd_value = _counter_leg_usd(swap, sol_price, exclude_mint=token_mint)
+        amount = -net
     else:
-        # both or neither -- not a clean buy/sell of this mint, skip
         return None
+
+    sol_out = sum(
+        float(n.get("amount", 0) or 0)
+        for n in native_transfers
+        if n.get("fromUserAccount") == wallet
+    ) / 1e9
+    sol_in = sum(
+        float(n.get("amount", 0) or 0)
+        for n in native_transfers
+        if n.get("toUserAccount") == wallet
+    ) / 1e9
+
+    if direction == "buy" and sol_out:
+        usd_value = sol_out * sol_price
+    elif direction == "sell" and sol_in:
+        usd_value = sol_in * sol_price
+    elif direction == "buy":
+        usd_value = sum(
+            float(t.get("tokenAmount", 0) or 0)
+            for t in token_transfers
+            if t.get("fromUserAccount") == wallet and t.get("mint") in STABLE_MINTS
+        )
+    else:
+        usd_value = sum(
+            float(t.get("tokenAmount", 0) or 0)
+            for t in token_transfers
+            if t.get("toUserAccount") == wallet and t.get("mint") in STABLE_MINTS
+        )
 
     if amount <= 0:
         return None
